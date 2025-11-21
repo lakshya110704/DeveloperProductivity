@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>DevProd — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 24px; }
+    .chart-wrap { width: 800px; max-width: 95%; margin-bottom: 40px; }
+  </style>
+</head>
+<body>
+  <h1>DevProd — Dashboard</h1>
+
+  <p>
+    Repositories polled:
+    {% if repos %}
+      <strong>{{ repos|join:", " }}</strong>
+    {% else %}
+      <em>(none configured — set REPOS_TO_POLL in .env)</em>
+    {% endif %}
+  </p>
+
+  <div>
+    <label for="repo-select">Select repo:</label>
+    <select id="repo-select">
+      {% for r in repos %}
+        <option value="{{ r }}">{{ r }}</option>
+      {% endfor %}
+    </select>
+    <button id="refresh-btn">Refresh</button>
+  </div>
+
+  <div class="chart-wrap">
+    <canvas id="cycleChart"></canvas>
+  </div>
+
+  <script>
+    const metricName = "pr_cycle_time_seconds";
+    const select = document.getElementById("repo-select");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const ctx = document.getElementById("cycleChart").getContext("2d");
+    let cycleChart = null;
+
+    async function fetchMetric(repo) {
+      const to = new Date().toISOString();
+      const from = new Date(Date.now() - 30*24*60*60*1000).toISOString();
+      const url = `/api/metrics/?metric=${metricName}&target=${encodeURIComponent(repo)}&from=${from}&to=${to}`;
+      const res = await fetch(url);
+      const j = await res.json();
+      return j.results || [];
+    }
+
+    function toChartData(results) {
+      const labels = results.map(r => r.window_start ? r.window_start.split("T")[0] : "");
+      const values = results.map(r => r.value || 0);
+      return { labels, values };
+    }
+
+    function renderChart(data) {
+      const cfg = {
+        type: "line",
+        data: {
+          labels: data.labels,
+          datasets: [{
+            label: "PR Cycle Time (seconds)",
+            data: data.values,
+            fill: false,
+            tension: 0.2,
+          }]
+        },
+        options: {
+          scales: {
+            y: { beginAtZero: true }
+          }
+        }
+      };
+      if (cycleChart) {
+        cycleChart.destroy();
+      }
+      cycleChart = new Chart(ctx, cfg);
+    }
+
+    async function refresh() {
+      const repo = select ? select.value : "";
+      if (!repo) {
+        alert("No repo configured in REPOS_TO_POLL.");
+        return;
+      }
+      const results = await fetchMetric(repo);
+      const chartData = toChartData(results);
+      renderChart(chartData);
+    }
+
+    refreshBtn.addEventListener("click", refresh);
+    window.addEventListener("load", () => {
+      if (select && select.options.length > 0) {
+        refresh();
+      }
+    });
+  </script>
+</body>
+</html>

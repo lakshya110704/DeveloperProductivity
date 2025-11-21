@@ -1,0 +1,10 @@
+Django>=4.2
+djangorestframework
+pymongo[srv]
+PyGithub
+python-dotenv
+gunicorn
+celery[redis]
+redis
+uvicorn
+python-multipart
