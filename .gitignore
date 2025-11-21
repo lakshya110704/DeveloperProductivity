@@ -1,0 +1,81 @@
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# ----------------------------
+# Django
+# ----------------------------
+db.sqlite3
+/staticfiles/
+media/
+*.log
+
+# Local settings
+.env
+.env.*
+
+
+# ----------------------------
+# VSCode
+# ----------------------------
+.vscode/
+.code-workspace
+
+# ----------------------------
+# macOS system files
+# ----------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+
+# ----------------------------
+# Pycharm / Jetbrains
+# ----------------------------
+.idea/
+*.iml
+
+
+# ----------------------------
+# Node / JS
+# ----------------------------
+node_modules/
+
+
+# ----------------------------
+# Backup & temp files
+# ----------------------------
+*.bak
+*.swp
+*.swo
+*~
+/tmp/
+
+
+# ----------------------------
+# Project-specific
+# ----------------------------
+
+# Fallback JSONL data
+/data/*.jsonl
+/data/*.txt
+/data/*.csv
+
+# Ignore Celery beat schedule if used
+celerybeat-schedule

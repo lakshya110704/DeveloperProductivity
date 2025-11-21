@@ -1,1 +1,0 @@
-{"metric": "pr_cycle_time_seconds", "target_type": "repo", "target_id": "isocpp/CppCoreGuidelines", "window_start": "2025-10-22T04:51:17.650573+00:00", "window_end": "2025-11-21T04:51:17.650573+00:00", "value": 86510.0, "count": 3, "computed_at": "2025-11-21T04:51:22.732936"}
