@@ -2,7 +2,7 @@
 import os
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from django.core.management.base import BaseCommand
 from django.conf import settings
 from pymongo import MongoClient, errors
@@ -107,19 +107,17 @@ class Command(BaseCommand):
         for full_name in repos:
             try:
                 repo = g.get_repo(full_name)
-                            # ---- STEP: fetch ONE commit (temporary, no loop) ----
             except Exception as e:
                 self.stderr.write(f"Error accessing repo {full_name}: {e}")
                 continue
 
-                        # ---- STEP: fetch a few commits (controlled loop) ----
+            # ---- Fetch commits ----
             try:
                 commits = repo.get_commits()
                 written = 0
-
                 limit = options.get("limit", 50)
 
-                for c in commits[:limit]: # VERY SMALL LIMIT for now
+                for c in commits[:limit]:
                     commit = c.commit
                     author = commit.author
 
@@ -135,17 +133,12 @@ class Command(BaseCommand):
                     write_commit_fallback(doc)
                     written += 1
 
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f"Wrote {written} commits for {full_name}"
-                    )
-                )
+                self.stdout.write(self.style.SUCCESS(f"Wrote {written} commits for {full_name}"))
             except Exception as e:
-                self.stdout.write(
-                    self.style.WARNING(f"Commit fetch/write failed: {e}")
-                )
+                self.stdout.write(self.style.WARNING(f"Commit fetch/write failed: {e}"))
 
             pulls = repo.get_pulls(state="all", sort="created", direction="desc")
+
             fetched = 0
             for pr in pulls:
                 if fetched >= options.get("limit", 50):
