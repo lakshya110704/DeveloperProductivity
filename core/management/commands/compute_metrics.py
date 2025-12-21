@@ -55,6 +55,26 @@ def read_pull_fallback():
                 continue
     return items
 
+def read_commits_fallback():
+    """
+    Read commit records from JSONL fallback.
+    Returns a list of commit dicts.
+    """
+    path = Path(settings.BASE_DIR) / "data" / "commits.jsonl"
+    if not path.exists():
+        return []
+
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                doc = json.loads(line)
+                doc["committed_at"] = parse_iso(doc.get("committed_at"))
+                items.append(doc)
+            except Exception:
+                continue
+    return items
+
 class Command(BaseCommand):
     help = "Compute metrics (pr_cycle_time_seconds and pr_merged_count) for last N days. Writes to Mongo if available, else to fallback JSONL."
 
@@ -136,10 +156,6 @@ class Command(BaseCommand):
         pulls = read_pull_fallback()
         per_repo = {}
 
-        # Fallback aggregation using JSONL
-        pulls = read_pull_fallback()
-        per_repo = {}
-
         for p in pulls:
             # parse created/merged
             c = parse_iso(p.get("created_at"))
@@ -214,6 +230,33 @@ class Command(BaseCommand):
                 "computed_at": datetime.now(timezone.utc).isoformat()
             }
             snapshots.append(fr_snap)
+
+        # ---- Commit count per developer (fallback) ----
+        commits = read_commits_fallback()
+
+        window_commits = [
+            c for c in commits
+            if c.get("committed_at") and c["committed_at"] >= window_start
+        ]
+
+        commits_by_dev = {}
+        for c in window_commits:
+            anon_id = (c.get("author") or {}).get("anon_id")
+            if not anon_id:
+                continue
+            commits_by_dev.setdefault(anon_id, []).append(c)
+
+        for anon_id, items in commits_by_dev.items():
+            snapshots.append({
+                "metric": "commit_count_per_developer",
+                "target_type": "developer",
+                "target_id": anon_id,
+                "window_start": window_start.isoformat(),
+                "window_end": now.isoformat(),
+                "value": len(items),
+                "count": len(items),
+                "computed_at": datetime.now(timezone.utc).isoformat(),
+            })
 
         if snapshots:
             with open(METRICS_FALLBACK, "a", encoding="utf-8") as f:
