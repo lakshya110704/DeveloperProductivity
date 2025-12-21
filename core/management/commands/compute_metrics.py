@@ -30,7 +30,6 @@ def parse_iso(s):
     if isinstance(s, datetime):
         dt = s
     else:
-        # Accept both "2025-11-20T19:30:59Z" and offset forms
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         try:
@@ -40,10 +39,8 @@ def parse_iso(s):
                 dt = datetime.fromisoformat(s.split(".")[0])
             except Exception:
                 return None
-    # If dt is naive, assume it's UTC and make it aware
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
-    # Convert aware datetimes to UTC
     return dt.astimezone(timezone.utc)
 
 def read_pull_fallback():
@@ -59,7 +56,7 @@ def read_pull_fallback():
     return items
 
 class Command(BaseCommand):
-    help = "Compute PR cycle time metric (pr_cycle_time_seconds) for last N days. Writes to Mongo if available, else to fallback JSONL."
+    help = "Compute metrics (pr_cycle_time_seconds and pr_merged_count) for last N days. Writes to Mongo if available, else to fallback JSONL."
 
     def add_arguments(self, parser):
         parser.add_argument("--days", type=int, default=30, help="Window in days to compute metrics for")
@@ -76,13 +73,14 @@ class Command(BaseCommand):
             snapshots_coll = db.metric_snapshots
             self.stdout.write(self.style.SUCCESS("Connected to MongoDB for aggregation."))
 
+            # PRs created within window and merged
             pipeline = [
                 {"$match": {"created_at": {"$gte": window_start}, "merged_at": {"$ne": None}}},
                 {"$project": {
                     "repo_full_name": 1,
                     "created_at": 1,
                     "merged_at": 1,
-                    "cycle_time_seconds": {"$divide":[ {"$subtract": ["$merged_at", "$created_at"]}, 1000 ]}
+                    "cycle_time_seconds": {"$divide": [{"$subtract": ["$merged_at", "$created_at"]}, 1000]}
                 }},
                 {"$group": {
                     "_id": "$repo_full_name",
@@ -93,7 +91,8 @@ class Command(BaseCommand):
 
             results = list(pulls_coll.aggregate(pipeline))
             for r in results:
-                doc = {
+                # cycle time snapshot
+                ct_doc = {
                     "metric": "pr_cycle_time_seconds",
                     "target_type": "repo",
                     "target_id": r["_id"],
@@ -101,41 +100,82 @@ class Command(BaseCommand):
                     "window_end": now,
                     "value": r.get("avg_cycle_time_sec"),
                     "count": r.get("count"),
-                    "computed_at": datetime.utcnow()
+                    "computed_at": datetime.now(timezone.utc)
                 }
                 snapshots_coll.update_one(
-                    {"metric": doc["metric"], "target_type": doc["target_type"], "target_id": doc["target_id"], "window_start": doc["window_start"], "window_end": doc["window_end"]},
-                    {"$set": doc},
+                    {"metric": ct_doc["metric"], "target_type": ct_doc["target_type"], "target_id": ct_doc["target_id"], "window_start": ct_doc["window_start"], "window_end": ct_doc["window_end"]},
+                    {"$set": ct_doc},
                     upsert=True
                 )
 
-            self.stdout.write(self.style.SUCCESS(f"Wrote {len(results)} metric snapshots to Mongo."))
+                # merged count snapshot
+                count_doc = {
+                    "metric": "pr_merged_count",
+                    "target_type": "repo",
+                    "target_id": r["_id"],
+                    "window_start": window_start,
+                    "window_end": now,
+                    "value": r.get("count"),
+                    "count": r.get("count"),
+                    "computed_at": datetime.now(timezone.utc)
+                }
+                snapshots_coll.update_one(
+                    {"metric": count_doc["metric"], "target_type": count_doc["target_type"], "target_id": count_doc["target_id"], "window_start": count_doc["window_start"], "window_end": count_doc["window_end"]},
+                    {"$set": count_doc},
+                    upsert=True
+                )
+
+            self.stdout.write(self.style.SUCCESS(f"Wrote {len(results)*2} metric snapshots to Mongo."))
             return
 
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"Could not use Mongo: {e}"))
             self.stdout.write(self.style.WARNING("Falling back to JSONL aggregation."))
 
-        # Fallback aggregation
+        # Fallback aggregation using JSONL
+        pulls = read_pull_fallback()
+        per_repo = {}
+
+        # Fallback aggregation using JSONL
         pulls = read_pull_fallback()
         per_repo = {}
 
         for p in pulls:
+            # parse created/merged
             c = parse_iso(p.get("created_at"))
             m = parse_iso(p.get("merged_at"))
             if not c or not m:
                 continue
             if c < window_start or m < window_start:
                 continue
-
-            delta = (m - c).total_seconds()
             repo = p.get("repo_full_name", "unknown")
-            per_repo.setdefault(repo, []).append(delta)
+            delta = (m - c).total_seconds()
+            per_repo.setdefault(repo, {"cycle_times": [], "first_review_seconds": [], "merged_count": 0})
+            per_repo[repo]["cycle_times"].append(delta)
+            per_repo[repo]["merged_count"] += 1
+
+            # compute first review time if reviews exist
+            reviews = p.get("reviews", []) or []
+            first_review_dt = None
+            for rv in reviews:
+                sub = rv.get("submitted_at")
+                sub_dt = parse_iso(sub)
+                if sub_dt:
+                    if first_review_dt is None or sub_dt < first_review_dt:
+                        first_review_dt = sub_dt
+            if first_review_dt:
+                # only include when first review exists and within window
+                if first_review_dt >= window_start:
+                    fr_delta = (first_review_dt - c).total_seconds()
+                    if fr_delta >= 0:
+                        per_repo[repo]["first_review_seconds"].append(fr_delta)
 
         snapshots = []
-        for repo, deltas in per_repo.items():
+        for repo, vals in per_repo.items():
+            # avg cycle time
+            deltas = vals.get("cycle_times", [])
             avg = mean(deltas) if deltas else None
-            snap = {
+            ct_snap = {
                 "metric": "pr_cycle_time_seconds",
                 "target_type": "repo",
                 "target_id": repo,
@@ -143,9 +183,37 @@ class Command(BaseCommand):
                 "window_end": now.isoformat(),
                 "value": avg,
                 "count": len(deltas),
-                "computed_at": datetime.utcnow().isoformat()
+                "computed_at": datetime.now(timezone.utc).isoformat()
             }
-            snapshots.append(snap)
+            snapshots.append(ct_snap)
+
+            # merged count
+            count_snap = {
+                "metric": "pr_merged_count",
+                "target_type": "repo",
+                "target_id": repo,
+                "window_start": window_start.isoformat(),
+                "window_end": now.isoformat(),
+                "value": vals.get("merged_count", 0),
+                "count": vals.get("merged_count", 0),
+                "computed_at": datetime.now(timezone.utc).isoformat()
+            }
+            snapshots.append(count_snap)
+
+            # first review time (average)
+            fr_list = vals.get("first_review_seconds", [])
+            fr_avg = mean(fr_list) if fr_list else None
+            fr_snap = {
+                "metric": "pr_first_review_seconds",
+                "target_type": "repo",
+                "target_id": repo,
+                "window_start": window_start.isoformat(),
+                "window_end": now.isoformat(),
+                "value": fr_avg,
+                "count": len(fr_list),
+                "computed_at": datetime.now(timezone.utc).isoformat()
+            }
+            snapshots.append(fr_snap)
 
         if snapshots:
             with open(METRICS_FALLBACK, "a", encoding="utf-8") as f:
