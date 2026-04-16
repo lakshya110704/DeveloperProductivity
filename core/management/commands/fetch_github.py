@@ -2,7 +2,7 @@
 import os
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from django.core.management.base import BaseCommand
 from django.conf import settings
 from pymongo import MongoClient, errors
@@ -15,6 +15,44 @@ FALLBACK_DIR = BASE_DIR / "data"
 FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
 PULLS_FALLBACK = FALLBACK_DIR / "pull_requests.jsonl"
 RAW_FALLBACK = FALLBACK_DIR / "raw_events.jsonl"
+COMMITS_FALLBACK = FALLBACK_DIR / "commits.jsonl"
+
+def write_commit_fallback(doc: dict):
+    """
+    Write a single commit record to the JSONL fallback.
+    Expects `doc` to already be JSON-serializable.
+    """
+    try:
+        with open(COMMITS_FALLBACK, "a", encoding="utf-8") as f:
+            f.write(json.dumps(doc, default=str) + "\n")
+    except Exception as e:
+        raise RuntimeError(f"Failed to write commit fallback: {e}")
+    
+def build_commit_doc(
+    *,
+    repo_full_name: str,
+    sha: str,
+    author_login: str = None,
+    author_email: str = None,
+    committed_at=None,
+    message: str = None,
+):
+    """
+    Build a normalized commit document for storage.
+    """
+    return {
+        "provider": "github",
+        "repo_full_name": repo_full_name,
+        "sha": sha,
+        "author": {
+            "login": author_login,
+            "email": author_email,
+            "anon_id": anon_id_for_email(author_email),
+        },
+        "committed_at": committed_at.isoformat() if committed_at else None,
+        "message": message,
+        "last_fetched_at": datetime.utcnow().isoformat(),
+    }
 
 def anon_id_for_email(email, salt="change_this_secret_salt"):
     import hashlib
@@ -73,12 +111,41 @@ class Command(BaseCommand):
                 self.stderr.write(f"Error accessing repo {full_name}: {e}")
                 continue
 
+            # ---- Fetch commits ----
+            try:
+                commits = repo.get_commits()
+                written = 0
+                limit = options.get("limit", 50)
+
+                for c in commits[:limit]:
+                    commit = c.commit
+                    author = commit.author
+
+                    doc = build_commit_doc(
+                        repo_full_name=full_name,
+                        sha=c.sha,
+                        author_login=c.author.login if c.author else None,
+                        author_email=author.email if author else None,
+                        committed_at=author.date if author else None,
+                        message=commit.message,
+                    )
+
+                    write_commit_fallback(doc)
+                    written += 1
+
+                self.stdout.write(self.style.SUCCESS(f"Wrote {written} commits for {full_name}"))
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"Commit fetch/write failed: {e}"))
+
             pulls = repo.get_pulls(state="all", sort="created", direction="desc")
+
             fetched = 0
             for pr in pulls:
                 if fetched >= options.get("limit", 50):
                     break
                 fetched += 1
+                # --- inside the for pr in pulls: loop, replace pr_json building with this ---
+                # Get full raw PR JSON when available
                 try:
                     pr_json = pr.raw_data
                 except AttributeError:
@@ -91,6 +158,22 @@ class Command(BaseCommand):
                         "closed_at": getattr(pr, "closed_at", None).isoformat() if getattr(pr, "closed_at", None) else None,
                     }
 
+                # Fetch reviews (best-effort; will be empty list for many PRs)
+                reviews_list = []
+                try:
+                    # iterate reviews (paginated)
+                    for r in pr.get_reviews():
+                        reviews_list.append({
+                            "id": getattr(r, "id", None),
+                            "user": getattr(r, "user", None).login if getattr(r, "user", None) else None,
+                            "state": getattr(r, "state", None),
+                            "submitted_at": getattr(r, "submitted_at", None).isoformat() if getattr(r, "submitted_at", None) else None,
+                        })
+                except Exception:
+                    # ignore review-fetch failures
+                    reviews_list = []
+
+                # Try to get author email where possible (GitHub API may hide it)
                 author_email = None
                 try:
                     if pr.user:
@@ -115,6 +198,7 @@ class Command(BaseCommand):
                     "additions": getattr(pr, "additions", None),
                     "deletions": getattr(pr, "deletions", None),
                     "changed_files": getattr(pr, "changed_files", None),
+                    "reviews": reviews_list,
                     "raw": pr_json,
                     "last_fetched_at": datetime.utcnow(),
                 }

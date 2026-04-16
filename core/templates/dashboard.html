@@ -28,6 +28,14 @@
         <option value="{{ r }}">{{ r }}</option>
       {% endfor %}
     </select>
+
+    <label for="metric-select" style="margin-left:16px">Metric:</label>
+    <select id="metric-select">
+      <option value="pr_cycle_time_seconds">PR Cycle Time (hours)</option>
+      <option value="pr_merged_count">PR Merged Count</option>
+      <option value="pr_first_review_seconds">PR First Review Time (hours)</option>
+    </select>
+
     <button id="refresh-btn">Refresh</button>
   </div>
 
@@ -35,69 +43,105 @@
     <canvas id="cycleChart"></canvas>
   </div>
 
-  <script>
-    const metricName = "pr_cycle_time_seconds";
-    const select = document.getElementById("repo-select");
-    const refreshBtn = document.getElementById("refresh-btn");
-    const ctx = document.getElementById("cycleChart").getContext("2d");
-    let cycleChart = null;
+<script>
+  const metricSelect = document.getElementById("metric-select");
+  const metricNameBase = "pr_cycle_time_seconds";
+  const select = document.getElementById("repo-select");
+  const refreshBtn = document.getElementById("refresh-btn");
+  const ctx = document.getElementById("cycleChart").getContext("2d");
+  let cycleChart = null;
 
-    async function fetchMetric(repo) {
-      const to = new Date().toISOString();
-      const from = new Date(Date.now() - 30*24*60*60*1000).toISOString();
-      const url = `/api/metrics/?metric=${metricName}&target=${encodeURIComponent(repo)}&from=${from}&to=${to}`;
-      const res = await fetch(url);
-      const j = await res.json();
-      return j.results || [];
-    }
+  function metricLabel(metric) {
+    if (metric === "pr_merged_count") return {label: "PRs Merged", unit: ""};
+    if (metric === "pr_cycle_time_seconds") return {label: "PR Cycle Time (hours)", unit: "h"};
+    if (metric === "pr_first_review_seconds") return {label: "First Review Time (hours)", unit: "h"};
+    return {label: metric, unit: ""};
+  }
 
-    function toChartData(results) {
-      const labels = results.map(r => r.window_start ? r.window_start.split("T")[0] : "");
-      const values = results.map(r => r.value || 0);
-      return { labels, values };
-    }
+  async function fetchMetric(repo, metric) {
+    const to = new Date().toISOString();
+    const from = new Date(Date.now() - 365*24*60*60*1000).toISOString(); // fetch up to 1 year by default
+    const url = `/api/metrics/?metric=${metric}&target=${encodeURIComponent(repo)}&from=${from}&to=${to}`;
+    const res = await fetch(url);
+    const j = await res.json();
+    return j.results || [];
+  }
 
-    function renderChart(data) {
-      const cfg = {
-        type: "line",
-        data: {
-          labels: data.labels,
-          datasets: [{
-            label: "PR Cycle Time (seconds)",
-            data: data.values,
-            fill: false,
-            tension: 0.2,
-          }]
-        },
-        options: {
-          scales: {
-            y: { beginAtZero: true }
-          }
-        }
-      };
-      if (cycleChart) {
-        cycleChart.destroy();
-      }
-      cycleChart = new Chart(ctx, cfg);
-    }
-
-    async function refresh() {
-      const repo = select ? select.value : "";
-      if (!repo) {
-        alert("No repo configured in REPOS_TO_POLL.");
-        return;
-      }
-      const results = await fetchMetric(repo);
-      const chartData = toChartData(results);
-      renderChart(chartData);
-    }
-
-    refreshBtn.addEventListener("click", refresh);
-    window.addEventListener("load", () => {
-      if (select && select.options.length > 0) {
-        refresh();
+  function toChartData(results, metric) {
+    // results sorted by window_start ascending
+    const labels = results.map(r => r.window_start ? r.window_start.split("T")[0] : "");
+    const values = results.map(r => {
+      if (metric === "pr_cycle_time_seconds") {
+        const sec = r.value || 0;
+        const hours = (sec || 0) / 3600.0;
+        return Math.round(hours * 100) / 100;
+      } else if (metric === "pr_first_review_seconds") {
+        const sec = r.value || 0;
+        const hours = (sec || 0) / 3600.0;
+        return Math.round(hours * 100) / 100;
+      } else {
+        return r.value || 0;
       }
     });
-  </script>
+    return { labels, values };
+  }
+
+  function renderChart(data, metric) {
+    const meta = metricLabel(metric);
+    const cfg = {
+      type: "line",
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: meta.label,
+          data: data.values,
+          fill: false,
+          tension: 0.2,
+        }]
+      },
+      options: {
+        scales: {
+          y: {
+            beginAtZero: true,
+            ticks: {
+              callback: function(value) { return meta.unit ? (value + meta.unit) : value; }
+            },
+            title: {
+              display: true,
+              text: meta.unit ? meta.unit : ""
+            }
+          }
+        },
+        plugins: {
+          tooltip: {
+            callbacks: {
+              label: function(context) {
+                const v = context.parsed.y;
+                const idx = context.dataIndex || 0;
+                const count = (context.dataset && context.dataset._counts && context.dataset._counts[idx]) || null;
+                return meta.unit ? ` ${v} ${meta.unit}` + (count !== null ? ` (n=${count})` : '') : ` ${v}` + (count !== null ? ` (n=${count})` : '');
+              }
+            }
+          }
+        }
+      }
+    };
+    if (cycleChart) cycleChart.destroy();
+    cycleChart = new Chart(ctx, cfg);
+  }
+
+  async function refresh() {
+    const repo = select ? select.value : "";
+    const metric = metricSelect ? metricSelect.value : "pr_cycle_time_seconds";
+    if (!repo) { alert("No repo configured in REPOS_TO_POLL."); return; }
+    const results = await fetchMetric(repo, metric);
+    const chartData = toChartData(results, metric);
+    renderChart(chartData, metric);
+  }
+
+  refreshBtn.addEventListener("click", refresh);
+  metricSelect.addEventListener("change", refresh);
+  window.addEventListener("load", () => { if (select && select.options.length > 0) refresh(); });
+</script>
 </body>
 </html>
