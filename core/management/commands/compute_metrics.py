@@ -1,4 +1,15 @@
-# core/management/commands/compute_metrics.py
+"""
+Metric computation command for Developer Productivity.
+
+Metrics are computed over a rolling time window and emitted as snapshots.
+
+Metric categories:
+- FLOW METRICS (primary): PR cycle time, review latency
+- THROUGHPUT METRICS (supporting): PR merged count
+- ACTIVITY METRICS (experimental): commit counts per developer
+
+MongoDB is optional. JSONL files are the source of truth during development.
+"""
 import os
 import json
 from datetime import datetime, timedelta, timezone
@@ -24,6 +35,9 @@ def try_get_db():
         db = client["devprod"]
     return db
 
+# -----------------------------
+# Time parsing utilities
+# -----------------------------
 def parse_iso(s):
     if not s:
         return None
@@ -43,6 +57,9 @@ def parse_iso(s):
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+# -----------------------------
+# Pull Request fallback readers
+# -----------------------------
 def read_pull_fallback():
     if not PULLS_FALLBACK.exists():
         return []
@@ -55,6 +72,9 @@ def read_pull_fallback():
                 continue
     return items
 
+# -----------------------------
+# Commit fallback readers
+# -----------------------------
 def read_commits_fallback():
     """
     Read commit records from JSONL fallback.
@@ -86,14 +106,16 @@ class Command(BaseCommand):
         now = datetime.now(timezone.utc)
         window_start = now - timedelta(days=days)
 
-        # Try Mongo first
+        # =============================
+        # Primary path: MongoDB metrics
+        # =============================
         try:
             db = try_get_db()
             pulls_coll = db.pull_requests
             snapshots_coll = db.metric_snapshots
             self.stdout.write(self.style.SUCCESS("Connected to MongoDB for aggregation."))
 
-            # PRs created within window and merged
+            # FLOW METRIC: PR cycle time & throughput (Mongo)
             pipeline = [
                 {"$match": {"created_at": {"$gte": window_start}, "merged_at": {"$ne": None}}},
                 {"$project": {
@@ -109,9 +131,10 @@ class Command(BaseCommand):
                 }}
             ]
 
+            #PR Metrics
             results = list(pulls_coll.aggregate(pipeline))
             for r in results:
-                # cycle time snapshot
+                # Metric: pr_cycle_time_seconds (delivery speed)
                 ct_doc = {
                     "metric": "pr_cycle_time_seconds",
                     "target_type": "repo",
@@ -128,7 +151,7 @@ class Command(BaseCommand):
                     upsert=True
                 )
 
-                # merged count snapshot
+                # Metric: pr_merged_count (throughput)
                 count_doc = {
                     "metric": "pr_merged_count",
                     "target_type": "repo",
@@ -152,7 +175,10 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(f"Could not use Mongo: {e}"))
             self.stdout.write(self.style.WARNING("Falling back to JSONL aggregation."))
 
-        # Fallback aggregation using JSONL
+        # =============================
+        # Fallback path: JSONL metrics
+        # =============================
+        # FLOW METRICS (primary): Pull Request analytics
         pulls = read_pull_fallback()
         per_repo = {}
 
@@ -186,9 +212,10 @@ class Command(BaseCommand):
                     if fr_delta >= 0:
                         per_repo[repo]["first_review_seconds"].append(fr_delta)
 
+        #Cycle Time Metrics
         snapshots = []
         for repo, vals in per_repo.items():
-            # avg cycle time
+            # Metric: pr_cycle_time_seconds (delivery speed)
             deltas = vals.get("cycle_times", [])
             avg = mean(deltas) if deltas else None
             ct_snap = {
@@ -203,7 +230,7 @@ class Command(BaseCommand):
             }
             snapshots.append(ct_snap)
 
-            # merged count
+            # Metric: pr_merged_count (throughput)
             count_snap = {
                 "metric": "pr_merged_count",
                 "target_type": "repo",
@@ -216,7 +243,7 @@ class Command(BaseCommand):
             }
             snapshots.append(count_snap)
 
-            # first review time (average)
+            # Metric: pr_first_review_seconds (review responsiveness)
             fr_list = vals.get("first_review_seconds", [])
             fr_avg = mean(fr_list) if fr_list else None
             fr_snap = {
@@ -231,7 +258,42 @@ class Command(BaseCommand):
             }
             snapshots.append(fr_snap)
 
-        # ---- Commit count per developer (fallback) ----
+        # FLOW PARTICIPATION METRIC (developer-level)
+        # Metric: pr_cycle_time_seconds_by_author
+        # Measures how PRs authored by a developer flow through the system.
+        # NOTE: This is a flow signal, NOT a performance score.
+        per_author = {}
+
+        for p in pulls:
+            author = (p.get("author") or {}).get("anon_id")
+            if not author:
+                continue
+
+            c = parse_iso(p.get("created_at"))
+            m = parse_iso(p.get("merged_at"))
+            if not c or not m:
+                continue
+            if c < window_start or m < window_start:
+                continue
+
+            delta = (m - c).total_seconds()
+            per_author.setdefault(author, []).append(delta)
+
+        for author, deltas in per_author.items():
+            if not deltas:
+                continue
+            snapshots.append({
+                "metric": "pr_cycle_time_seconds_by_author",
+                "target_type": "developer",
+                "target_id": author,
+                "window_start": window_start.isoformat(),
+                "window_end": now.isoformat(),
+                "value": mean(deltas),
+                "count": len(deltas),
+                "computed_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        # ACTIVITY METRIC (experimental): commit_count_per_developer
         commits = read_commits_fallback()
 
         window_commits = [
