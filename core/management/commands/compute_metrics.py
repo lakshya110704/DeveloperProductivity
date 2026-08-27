@@ -2,11 +2,14 @@
 Metric computation command for Developer Productivity.
 
 Metrics are computed over a rolling time window and emitted as snapshots.
+The JSONL fallback path aggregates with pandas; the MongoDB path aggregates
+with the native pipeline.
 
 Metric categories:
-- FLOW METRICS (primary): PR cycle time, review latency
-- THROUGHPUT METRICS (supporting): PR merged count
-- ACTIVITY METRICS (experimental): commit counts per developer
+- FLOW METRICS: PR cycle time, review latency, review count, approval rate
+- THROUGHPUT METRICS: PR merged/open/closed counts
+- SIZE METRICS: PR additions, deletions, changed files
+- ACTIVITY METRICS: commit counts, active days, commit velocity
 
 MongoDB is optional. JSONL files are the source of truth during development.
 """
@@ -18,10 +21,12 @@ from django.conf import settings
 from pathlib import Path
 from pymongo import MongoClient
 from statistics import mean
+import pandas as pd
 
 BASE_DIR = Path(settings.BASE_DIR)
 FALLBACK_DIR = BASE_DIR / "data"
 PULLS_FALLBACK = FALLBACK_DIR / "pull_requests.jsonl"
+COMMITS_FALLBACK = FALLBACK_DIR / "commits.jsonl"
 METRICS_FALLBACK = FALLBACK_DIR / "metric_snapshots.jsonl"
 
 def try_get_db():
@@ -58,13 +63,13 @@ def parse_iso(s):
     return dt.astimezone(timezone.utc)
 
 # -----------------------------
-# Pull Request fallback readers
+# Fallback readers -> DataFrames
 # -----------------------------
-def read_pull_fallback():
-    if not PULLS_FALLBACK.exists():
+def _read_jsonl(path):
+    if not path.exists():
         return []
     items = []
-    with open(PULLS_FALLBACK, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             try:
                 items.append(json.loads(line))
@@ -72,31 +77,64 @@ def read_pull_fallback():
                 continue
     return items
 
-# -----------------------------
-# Commit fallback readers
-# -----------------------------
-def read_commits_fallback():
-    """
-    Read commit records from JSONL fallback.
-    Returns a list of commit dicts.
-    """
-    path = Path(settings.BASE_DIR) / "data" / "commits.jsonl"
-    if not path.exists():
-        return []
+def read_pulls_df():
+    rows = _read_jsonl(PULLS_FALLBACK)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["created_at"] = df.get("created_at", pd.Series(dtype=object)).map(parse_iso)
+    df["merged_at"] = df.get("merged_at", pd.Series(dtype=object)).map(parse_iso)
+    df["closed_at"] = df.get("closed_at", pd.Series(dtype=object)).map(parse_iso)
+    df["author_anon_id"] = df["author"].map(lambda a: (a or {}).get("anon_id") if isinstance(a, dict) else None)
+    df["review_count"] = df["reviews"].map(lambda r: len(r) if isinstance(r, list) else 0)
+    df["approved"] = df["reviews"].map(
+        lambda r: any((rv or {}).get("state") == "APPROVED" for rv in r) if isinstance(r, list) else False
+    )
+    df["first_review_at"] = df["reviews"].map(_first_review_at)
+    return df
 
-    items = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                doc = json.loads(line)
-                doc["committed_at"] = parse_iso(doc.get("committed_at"))
-                items.append(doc)
-            except Exception:
-                continue
+def _first_review_at(reviews):
+    if not isinstance(reviews, list) or not reviews:
+        return None
+    dts = [parse_iso(rv.get("submitted_at")) for rv in reviews if isinstance(rv, dict)]
+    dts = [d for d in dts if d is not None]
+    return min(dts) if dts else None
+
+def read_commits_df():
+    rows = _read_jsonl(COMMITS_FALLBACK)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["committed_at"] = df.get("committed_at", pd.Series(dtype=object)).map(parse_iso)
+    df["author_anon_id"] = df["author"].map(lambda a: (a or {}).get("anon_id") if isinstance(a, dict) else None)
+    df["message_len"] = df.get("message", "").fillna("").map(len)
+    df["date"] = df["committed_at"].map(lambda d: d.date() if pd.notna(d) and d is not None else None)
+    return df
+
+# kept for callers that still want plain dict rows (e.g. tests)
+def read_pull_fallback():
+    return _read_jsonl(PULLS_FALLBACK)
+
+def read_commits_fallback():
+    items = _read_jsonl(COMMITS_FALLBACK)
+    for doc in items:
+        doc["committed_at"] = parse_iso(doc.get("committed_at"))
     return items
 
+def _snapshot(metric, target_type, target_id, value, count, window_start, now):
+    return {
+        "metric": metric,
+        "target_type": target_type,
+        "target_id": target_id,
+        "window_start": window_start.isoformat(),
+        "window_end": now.isoformat(),
+        "value": value,
+        "count": count,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
 class Command(BaseCommand):
-    help = "Compute metrics (pr_cycle_time_seconds and pr_merged_count) for last N days. Writes to Mongo if available, else to fallback JSONL."
+    help = "Compute 15+ developer productivity metrics for the last N days, aggregated with pandas. Writes to Mongo if available, else to fallback JSONL."
 
     def add_arguments(self, parser):
         parser.add_argument("--days", type=int, default=30, help="Window in days to compute metrics for")
@@ -115,7 +153,6 @@ class Command(BaseCommand):
             snapshots_coll = db.metric_snapshots
             self.stdout.write(self.style.SUCCESS("Connected to MongoDB for aggregation."))
 
-            # FLOW METRIC: PR cycle time & throughput (Mongo)
             pipeline = [
                 {"$match": {"created_at": {"$gte": window_start}, "merged_at": {"$ne": None}}},
                 {"$project": {
@@ -130,199 +167,97 @@ class Command(BaseCommand):
                     "count": {"$sum": 1}
                 }}
             ]
-
-            #PR Metrics
             results = list(pulls_coll.aggregate(pipeline))
             for r in results:
-                # Metric: pr_cycle_time_seconds (delivery speed)
-                ct_doc = {
-                    "metric": "pr_cycle_time_seconds",
-                    "target_type": "repo",
-                    "target_id": r["_id"],
-                    "window_start": window_start,
-                    "window_end": now,
-                    "value": r.get("avg_cycle_time_sec"),
-                    "count": r.get("count"),
-                    "computed_at": datetime.now(timezone.utc)
-                }
+                ct_doc = _snapshot("pr_cycle_time_seconds", "repo", r["_id"], r.get("avg_cycle_time_sec"), r.get("count"), window_start, now)
                 snapshots_coll.update_one(
                     {"metric": ct_doc["metric"], "target_type": ct_doc["target_type"], "target_id": ct_doc["target_id"], "window_start": ct_doc["window_start"], "window_end": ct_doc["window_end"]},
-                    {"$set": ct_doc},
-                    upsert=True
+                    {"$set": ct_doc}, upsert=True,
                 )
-
-                # Metric: pr_merged_count (throughput)
-                count_doc = {
-                    "metric": "pr_merged_count",
-                    "target_type": "repo",
-                    "target_id": r["_id"],
-                    "window_start": window_start,
-                    "window_end": now,
-                    "value": r.get("count"),
-                    "count": r.get("count"),
-                    "computed_at": datetime.now(timezone.utc)
-                }
+                count_doc = _snapshot("pr_merged_count", "repo", r["_id"], r.get("count"), r.get("count"), window_start, now)
                 snapshots_coll.update_one(
                     {"metric": count_doc["metric"], "target_type": count_doc["target_type"], "target_id": count_doc["target_id"], "window_start": count_doc["window_start"], "window_end": count_doc["window_end"]},
-                    {"$set": count_doc},
-                    upsert=True
+                    {"$set": count_doc}, upsert=True,
                 )
-
             self.stdout.write(self.style.SUCCESS(f"Wrote {len(results)*2} metric snapshots to Mongo."))
             return
-
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"Could not use Mongo: {e}"))
-            self.stdout.write(self.style.WARNING("Falling back to JSONL aggregation."))
+            self.stdout.write(self.style.WARNING("Falling back to pandas/JSONL aggregation."))
 
         # =============================
-        # Fallback path: JSONL metrics
+        # Fallback path: pandas aggregation over JSONL
         # =============================
-        # FLOW METRICS (primary): Pull Request analytics
-        pulls = read_pull_fallback()
-        per_repo = {}
-
-        for p in pulls:
-            # parse created/merged
-            c = parse_iso(p.get("created_at"))
-            m = parse_iso(p.get("merged_at"))
-            if not c or not m:
-                continue
-            if c < window_start or m < window_start:
-                continue
-            repo = p.get("repo_full_name", "unknown")
-            delta = (m - c).total_seconds()
-            per_repo.setdefault(repo, {"cycle_times": [], "first_review_seconds": [], "merged_count": 0})
-            per_repo[repo]["cycle_times"].append(delta)
-            per_repo[repo]["merged_count"] += 1
-
-            # compute first review time if reviews exist
-            reviews = p.get("reviews", []) or []
-            first_review_dt = None
-            for rv in reviews:
-                sub = rv.get("submitted_at")
-                sub_dt = parse_iso(sub)
-                if sub_dt:
-                    if first_review_dt is None or sub_dt < first_review_dt:
-                        first_review_dt = sub_dt
-            if first_review_dt:
-                # only include when first review exists and within window
-                if first_review_dt >= window_start:
-                    fr_delta = (first_review_dt - c).total_seconds()
-                    if fr_delta >= 0:
-                        per_repo[repo]["first_review_seconds"].append(fr_delta)
-
-        #Cycle Time Metrics
         snapshots = []
-        for repo, vals in per_repo.items():
-            # Metric: pr_cycle_time_seconds (delivery speed)
-            deltas = vals.get("cycle_times", [])
-            avg = mean(deltas) if deltas else None
-            ct_snap = {
-                "metric": "pr_cycle_time_seconds",
-                "target_type": "repo",
-                "target_id": repo,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "value": avg,
-                "count": len(deltas),
-                "computed_at": datetime.now(timezone.utc).isoformat()
-            }
-            snapshots.append(ct_snap)
+        pulls = read_pulls_df()
 
-            # Metric: pr_merged_count (throughput)
-            count_snap = {
-                "metric": "pr_merged_count",
-                "target_type": "repo",
-                "target_id": repo,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "value": vals.get("merged_count", 0),
-                "count": vals.get("merged_count", 0),
-                "computed_at": datetime.now(timezone.utc).isoformat()
-            }
-            snapshots.append(count_snap)
+        if not pulls.empty:
+            merged = pulls[pulls["merged_at"].notna() & pulls["created_at"].notna()].copy()
+            merged = merged[(merged["created_at"] >= window_start) & (merged["merged_at"] >= window_start)]
+            merged["cycle_time_seconds"] = (merged["merged_at"] - merged["created_at"]).dt.total_seconds()
 
-            # Metric: pr_first_review_seconds (review responsiveness)
-            fr_list = vals.get("first_review_seconds", [])
-            fr_avg = mean(fr_list) if fr_list else None
-            fr_snap = {
-                "metric": "pr_first_review_seconds",
-                "target_type": "repo",
-                "target_id": repo,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "value": fr_avg,
-                "count": len(fr_list),
-                "computed_at": datetime.now(timezone.utc).isoformat()
-            }
-            snapshots.append(fr_snap)
+            frv = merged[merged["first_review_at"].notna() & (merged["first_review_at"] >= window_start)].copy()
+            frv["first_review_seconds"] = (frv["first_review_at"] - frv["created_at"]).dt.total_seconds()
+            frv = frv[frv["first_review_seconds"] >= 0]
 
-        # FLOW PARTICIPATION METRIC (developer-level)
-        # Metric: pr_cycle_time_seconds_by_author
-        # Measures how PRs authored by a developer flow through the system.
-        # NOTE: This is a flow signal, NOT a performance score.
-        per_author = {}
+            # ---- per-repo metrics ----
+            by_repo = merged.groupby("repo_full_name")
+            for repo, g in by_repo:
+                snapshots.append(_snapshot("pr_cycle_time_seconds", "repo", repo, g["cycle_time_seconds"].mean(), len(g), window_start, now))
+                snapshots.append(_snapshot("pr_merged_count", "repo", repo, len(g), len(g), window_start, now))
+                snapshots.append(_snapshot("pr_avg_additions", "repo", repo, g["additions"].dropna().mean() if "additions" in g else None, g["additions"].dropna().shape[0] if "additions" in g else 0, window_start, now))
+                snapshots.append(_snapshot("pr_avg_deletions", "repo", repo, g["deletions"].dropna().mean() if "deletions" in g else None, g["deletions"].dropna().shape[0] if "deletions" in g else 0, window_start, now))
+                snapshots.append(_snapshot("pr_avg_changed_files", "repo", repo, g["changed_files"].dropna().mean() if "changed_files" in g else None, g["changed_files"].dropna().shape[0] if "changed_files" in g else 0, window_start, now))
+                snapshots.append(_snapshot("pr_avg_review_count", "repo", repo, g["review_count"].mean(), len(g), window_start, now))
+                snapshots.append(_snapshot("pr_approval_rate", "repo", repo, float(g["approved"].mean()), len(g), window_start, now))
 
-        for p in pulls:
-            author = (p.get("author") or {}).get("anon_id")
-            if not author:
-                continue
+            for repo, g in frv.groupby("repo_full_name"):
+                snapshots.append(_snapshot("pr_first_review_seconds", "repo", repo, g["first_review_seconds"].mean(), len(g), window_start, now))
 
-            c = parse_iso(p.get("created_at"))
-            m = parse_iso(p.get("merged_at"))
-            if not c or not m:
-                continue
-            if c < window_start or m < window_start:
-                continue
+            # PRs opened in-window regardless of merge state, for open/closed throughput
+            opened = pulls[pulls["created_at"].notna() & (pulls["created_at"] >= window_start)].copy()
+            open_now = opened[opened["state"] == "open"]
+            for repo, g in open_now.groupby("repo_full_name"):
+                snapshots.append(_snapshot("pr_open_count", "repo", repo, len(g), len(g), window_start, now))
 
-            delta = (m - c).total_seconds()
-            per_author.setdefault(author, []).append(delta)
+            closed_unmerged = opened[(opened["state"] == "closed") & opened["merged_at"].isna()]
+            for repo, g in closed_unmerged.groupby("repo_full_name"):
+                snapshots.append(_snapshot("pr_closed_without_merge_count", "repo", repo, len(g), len(g), window_start, now))
 
-        for author, deltas in per_author.items():
-            if not deltas:
-                continue
-            snapshots.append({
-                "metric": "pr_cycle_time_seconds_by_author",
-                "target_type": "developer",
-                "target_id": author,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "value": mean(deltas),
-                "count": len(deltas),
-                "computed_at": datetime.now(timezone.utc).isoformat(),
-            })
+            # ---- per-developer (author) metrics ----
+            for author, g in merged.groupby("author_anon_id"):
+                if not author:
+                    continue
+                snapshots.append(_snapshot("pr_cycle_time_seconds_by_author", "developer", author, g["cycle_time_seconds"].mean(), len(g), window_start, now))
 
-        # ACTIVITY METRIC (experimental): commit_count_per_developer
-        commits = read_commits_fallback()
+            for author, g in opened.groupby("author_anon_id"):
+                if not author:
+                    continue
+                snapshots.append(_snapshot("pr_opened_count_by_author", "developer", author, len(g), len(g), window_start, now))
 
-        window_commits = [
-            c for c in commits
-            if c.get("committed_at") and c["committed_at"] >= window_start
-        ]
+        # ---- commit-based metrics ----
+        commits = read_commits_df()
+        if not commits.empty:
+            wc = commits[commits["committed_at"].notna() & (commits["committed_at"] >= window_start)].copy()
 
-        commits_by_dev = {}
-        for c in window_commits:
-            anon_id = (c.get("author") or {}).get("anon_id")
-            if not anon_id:
-                continue
-            commits_by_dev.setdefault(anon_id, []).append(c)
+            for anon_id, g in wc.groupby("author_anon_id"):
+                if not anon_id:
+                    continue
+                snapshots.append(_snapshot("commit_count_per_developer", "developer", anon_id, len(g), len(g), window_start, now))
+                snapshots.append(_snapshot("commit_active_days_per_developer", "developer", anon_id, g["date"].nunique(), len(g), window_start, now))
+                snapshots.append(_snapshot("commit_avg_message_length", "developer", anon_id, g["message_len"].mean(), len(g), window_start, now))
 
-        for anon_id, items in commits_by_dev.items():
-            snapshots.append({
-                "metric": "commit_count_per_developer",
-                "target_type": "developer",
-                "target_id": anon_id,
-                "window_start": window_start.isoformat(),
-                "window_end": now.isoformat(),
-                "value": len(items),
-                "count": len(items),
-                "computed_at": datetime.now(timezone.utc).isoformat(),
-            })
+            for repo, g in wc.groupby("repo_full_name"):
+                span_days = max((now - window_start).days, 1)
+                snapshots.append(_snapshot("repo_commit_velocity", "repo", repo, len(g) / span_days, len(g), window_start, now))
 
         if snapshots:
             with open(METRICS_FALLBACK, "a", encoding="utf-8") as f:
                 for s in snapshots:
                     f.write(json.dumps(s, default=str) + "\n")
 
-        self.stdout.write(self.style.SUCCESS(f"Computed {len(snapshots)} snapshot(s) and wrote to {METRICS_FALLBACK}"))
+        metric_kinds = sorted({s["metric"] for s in snapshots})
+        self.stdout.write(self.style.SUCCESS(
+            f"Computed {len(snapshots)} snapshot(s) across {len(metric_kinds)} metric types and wrote to {METRICS_FALLBACK}"
+        ))
+        self.stdout.write(self.style.SUCCESS(f"Metric types: {', '.join(metric_kinds)}"))

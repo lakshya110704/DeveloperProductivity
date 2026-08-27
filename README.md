@@ -36,25 +36,65 @@ We focus on: - ✅ Flow metrics (how work moves) - ✅ Activity signals
 
 ## 🏗️ Architecture
 
-GitHub API → fetch_github.py → JSONL / Mongo → compute_metrics.py →
-metric_snapshots → API → Dashboard
+GitHub API → fetch_github.py → JSONL / Mongo → compute_metrics.py
+(pandas aggregation) → metric_snapshots → API → Dashboard (Chart.js) /
+generate_report.py (matplotlib PNGs)
+
+Ingestion and metric computation can run on demand via `manage.py`, or
+on a schedule via Celery beat (`proj/celery.py`, `core/tasks.py`) — see
+Automation below.
 
 ------------------------------------------------------------------------
 
 ## 📊 Current Metrics
 
-### 🟦 Flow Metrics
+`compute_metrics.py` aggregates the JSONL fallback with pandas and
+emits 16 metric types per run:
 
--   pr_cycle_time_seconds
+### 🟦 Flow
+
+-   pr_cycle_time_seconds (+ by_author)
 -   pr_first_review_seconds
+-   pr_avg_review_count
+-   pr_approval_rate
 
 ### 🟩 Throughput
 
 -   pr_merged_count
+-   pr_open_count
+-   pr_closed_without_merge_count
+-   pr_opened_count_by_author
+
+### 🟪 Size
+
+-   pr_avg_additions
+-   pr_avg_deletions
+-   pr_avg_changed_files
 
 ### 🟨 Activity
 
 -   commit_count_per_developer
+-   commit_active_days_per_developer
+-   commit_avg_message_length
+-   repo_commit_velocity
+
+Run `python manage.py generate_report` to render each series as a
+static PNG chart under `data/reports/` (matplotlib), separate from the
+live Chart.js dashboard.
+
+------------------------------------------------------------------------
+
+## ⏱️ Automation
+
+Ingestion and metric computation are wired as Celery tasks
+(`core/tasks.py`) on a beat schedule (`proj/celery.py`): PRs/commits
+are pulled every 30 minutes, metrics recomputed hourly. Requires Redis
+(`REDIS_URL` in `.env`) as the broker.
+
+``` bash
+celery -A proj worker -l info
+celery -A proj beat -l info
+```
 
 ------------------------------------------------------------------------
 

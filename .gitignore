@@ -77,5 +77,8 @@ node_modules/
 /data/*.txt
 /data/*.csv
 
+# Generated matplotlib chart reports
+/data/reports/
+
 # Ignore Celery beat schedule if used
 celerybeat-schedule

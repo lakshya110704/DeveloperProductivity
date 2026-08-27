@@ -72,6 +72,11 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 REPOS_TO_POLL = os.getenv("REPOS_TO_POLL", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# --- Celery: automates the fetch_github -> compute_metrics ETL loop (see proj/celery.py) ---
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_TIMEZONE = "UTC"
+
 # Minimal REST framework config (JSON only)
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [

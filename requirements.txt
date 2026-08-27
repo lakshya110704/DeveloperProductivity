@@ -8,3 +8,5 @@ celery[redis]
 redis
 uvicorn
 python-multipart
+pandas
+matplotlib
