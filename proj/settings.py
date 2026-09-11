@@ -71,6 +71,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/devprod")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 REPOS_TO_POLL = os.getenv("REPOS_TO_POLL", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+LINEAR_API_KEY = os.getenv("LINEAR_API_KEY", "")
 
 # --- Celery: automates the fetch_github -> compute_metrics ETL loop (see proj/celery.py) ---
 CELERY_BROKER_URL = REDIS_URL

@@ -27,6 +27,7 @@ BASE_DIR = Path(settings.BASE_DIR)
 FALLBACK_DIR = BASE_DIR / "data"
 PULLS_FALLBACK = FALLBACK_DIR / "pull_requests.jsonl"
 COMMITS_FALLBACK = FALLBACK_DIR / "commits.jsonl"
+TASKS_FALLBACK = FALLBACK_DIR / "tasks.jsonl"
 METRICS_FALLBACK = FALLBACK_DIR / "metric_snapshots.jsonl"
 
 def try_get_db():
@@ -109,6 +110,22 @@ def read_commits_df():
     df["author_anon_id"] = df["author"].map(lambda a: (a or {}).get("anon_id") if isinstance(a, dict) else None)
     df["message_len"] = df.get("message", "").fillna("").map(len)
     df["date"] = df["committed_at"].map(lambda d: d.date() if pd.notna(d) and d is not None else None)
+    return df
+
+def read_tasks_df():
+    """
+    Canonical tasks (core/connectors/schema.py), source-agnostic --
+    written by fetch_linear.py today, fetch_github.py's Issues path
+    and future connectors (Jira, Asana, ...) land in the same file.
+    """
+    rows = _read_jsonl(TASKS_FALLBACK)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["created_at"] = df.get("created_at", pd.Series(dtype=object)).map(parse_iso)
+    df["due_at"] = df.get("due_at", pd.Series(dtype=object)).map(parse_iso)
+    df["completed_at"] = df.get("completed_at", pd.Series(dtype=object)).map(parse_iso)
+    df["assignee_anon_id"] = df["assignee"].map(lambda a: (a or {}).get("anon_id") if isinstance(a, dict) else None)
     return df
 
 # kept for callers that still want plain dict rows (e.g. tests)
@@ -250,6 +267,40 @@ class Command(BaseCommand):
             for repo, g in wc.groupby("repo_full_name"):
                 span_days = max((now - window_start).days, 1)
                 snapshots.append(_snapshot("repo_commit_velocity", "repo", repo, len(g) / span_days, len(g), window_start, now))
+
+        # ---- task-based metrics (source-agnostic: Linear today, GitHub Issues / Jira later) ----
+        tasks = read_tasks_df()
+        if not tasks.empty:
+            in_window = tasks[tasks["created_at"].notna() & (tasks["created_at"] >= window_start)].copy()
+
+            # DEADLINE METRIC (individual, self-facing): on-time completion rate.
+            # Deliberately a rate against the person's own task set, not a
+            # comparison to teammates -- "did you hit your own deadlines."
+            with_due = in_window[in_window["due_at"].notna()].copy()
+            done_with_due = with_due[(with_due["status"] == "done") & with_due["completed_at"].notna()].copy()
+            done_with_due["on_time"] = done_with_due["completed_at"] <= done_with_due["due_at"]
+
+            for anon_id, g in done_with_due.groupby("assignee_anon_id"):
+                if not anon_id:
+                    continue
+                snapshots.append(_snapshot("task_on_time_rate", "developer", anon_id, float(g["on_time"].mean()), len(g), window_start, now))
+
+            # currently overdue and still open -- "lagging," scoped to the task, not the person
+            overdue_open = with_due[(with_due["due_at"] < now) & (with_due["status"].isin(["open", "in_progress"]))]
+            for anon_id, g in overdue_open.groupby("assignee_anon_id"):
+                if not anon_id:
+                    continue
+                snapshots.append(_snapshot("task_overdue_open_count", "developer", anon_id, len(g), len(g), window_start, now))
+
+            # TEAM EFFICIENCY METRIC (team-level, not individual): completion rate
+            # for the project/team as a whole -- this is the number a manager
+            # should look at instead of ranking individual completion rates.
+            for project, g in in_window.groupby("project"):
+                completed = g[g["status"] == "done"]
+                snapshots.append(_snapshot("team_task_completion_rate", "project", project, len(completed) / len(g) if len(g) else None, len(g), window_start, now))
+                proj_due = g[g["due_at"].notna()]
+                proj_overdue = proj_due[(proj_due["due_at"] < now) & (proj_due["status"].isin(["open", "in_progress"]))]
+                snapshots.append(_snapshot("team_overdue_open_count", "project", project, len(proj_overdue), len(proj_due), window_start, now))
 
         if snapshots:
             with open(METRICS_FALLBACK, "a", encoding="utf-8") as f:
