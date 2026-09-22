@@ -82,3 +82,4 @@ node_modules/
 
 # Ignore Celery beat schedule if used
 celerybeat-schedule
+.envrc
